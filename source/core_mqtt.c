@@ -609,8 +609,6 @@ static int32_t sendPacket( MQTTContext_t * pContext,
     assert( pContext->transportInterface.send != NULL );
     assert( pIndex != NULL );
 
-    bytesRemaining = bytesToSend;
-
     /* Record the most recent time of successful transmission. */
     lastSendTimeMs = pContext->getTime();
 
@@ -1297,6 +1295,214 @@ static MQTTStatus_t handleIncomingAck( MQTTContext_t * pContext,
         appCallback( pContext, pIncomingPacket, &deserializedInfo );
         /* In case a SUBACK indicated refusal, reset the status to continue the loop. */
         status = MQTTSuccess;
+    }
+
+    return status;
+}
+
+/*-----------------------------------------------------------*/
+
+MQTTStatus_t MQTT_HandleKeepAlive( MQTTContext_t * pContext )
+{
+    MQTTStatus_t status = MQTTBadParameter;
+
+    if( pContext == NULL || pContext->getTime == NULL )
+    {
+        status = MQTTBadParameter;
+    }
+    else
+    {
+        status = handleKeepAlive( pContext );
+    }
+
+    return status;
+}
+
+/*-----------------------------------------------------------*/
+
+/**
+ * @brief A value that represents an invalid remaining length.
+ *
+ * This value is greater than what is allowed by the MQTT specification.
+ */
+#define MQTT_REMAINING_LENGTH_INVALID             ( ( size_t ) 268435456 )
+
+typedef struct ByteIterator
+{
+    const uint8_t * p;
+    const uint8_t * pEnd;
+} ByteIterator_t;
+
+static MQTTStatus_t parseLengthField( ByteIterator_t * pIterator,
+                                      size_t * pLength )
+{
+    uint8_t bitOffset = 0U;
+    MQTTStatus_t status = MQTTSuccess;
+
+    assert( pIterator != NULL );
+    assert( pIterator->p != NULL );
+    assert( pIterator->p < pIterator->pEnd );
+    assert( pLength != NULL );
+
+    /* Decode variable-length "Remaining Length" field ( 1 - 4 bytes ) */
+    ( *pLength ) = ( *( pIterator->p ) & 0x7FU );
+
+    while( ( *( pIterator->p ) & 0x80U ) == 0x80U )
+    {
+        /* Increase bit offset by 7 */
+        bitOffset += 7U;
+
+        /* Check that remainingLength is <= 4 bytes, <= 28 significant bits long */
+        if( bitOffset <= 21U )
+        {
+            /* Iterate to next byte */
+            ( pIterator->p )++;
+
+            /* Update length */
+            ( *pLength ) += ( *( pIterator->p ) & 0x7FU ) << bitOffset;
+        }
+        else
+        {
+            ( *pLength ) = MQTT_REMAINING_LENGTH_INVALID;
+            status = MQTTBadResponse;
+            break;
+        }
+    }
+
+    return status;
+}
+
+static MQTTStatus_t parseControlPacketType( ByteIterator_t * pIterator,
+                                            uint8_t * pControlPacketType )
+{
+    MQTTStatus_t status = MQTTSuccess;
+
+    assert( pIterator != NULL );
+    assert( pIterator->p != NULL );
+    assert( pIterator->pEnd > pIterator->p );
+    assert( pControlPacketType != NULL );
+
+    *pControlPacketType = *( pIterator->p );
+
+    switch( ( *pControlPacketType ) & 0xF0U )
+    {
+        case MQTT_PACKET_TYPE_CONNECT:
+        case MQTT_PACKET_TYPE_CONNACK:
+        case MQTT_PACKET_TYPE_PUBACK:
+        case MQTT_PACKET_TYPE_PUBREC:
+        case MQTT_PACKET_TYPE_PUBCOMP:
+        case MQTT_PACKET_TYPE_UNSUBACK:
+        case MQTT_PACKET_TYPE_SUBACK:
+        case MQTT_PACKET_TYPE_PINGREQ:
+        case MQTT_PACKET_TYPE_PINGRESP:
+        case MQTT_PACKET_TYPE_DISCONNECT:
+            /* MQTT-2.2.2-1: lower 4 bits must be zero. */
+            if( ( ( *pControlPacketType ) & 0x0FU ) != 0x00U )
+            {
+                status = MQTTBadResponse;
+            }
+            break;
+
+        case MQTT_PACKET_TYPE_PUBLISH:
+            /* MQTT-3.3.1-4: Qos: flags[2:1] may not be 0b11 (0x6) */
+            if( ( ( *pControlPacketType ) & 0x06U ) == 0x06U )
+            {
+                status = MQTTBadResponse;
+            }
+            break;
+
+        case MQTT_PACKET_TYPE_PUBREL:
+        case MQTT_PACKET_TYPE_SUBSCRIBE:
+        case MQTT_PACKET_TYPE_UNSUBSCRIBE:
+            /* MQTT-2.2.2-1: flags must be 0b0010 */
+            if( ( ( *pControlPacketType ) & 0x0FU ) != 0x02U )
+            {
+                status = MQTTBadResponse;
+            }
+            break;
+
+        default:
+            status = MQTTBadResponse;
+            break;
+    }
+
+    /* Advance iterator */
+    ( pIterator->p )++;
+
+    return status;
+}
+
+/*-----------------------------------------------------------*/
+
+MQTTStatus_t MQTT_ProcessReceivedBytes( MQTTContext_t * pContext,
+                                        const uint8_t * pBuffer,
+                                        size_t bufferLength,
+                                        size_t * pPacketLength )
+{
+    MQTTStatus_t status = MQTTSuccess;
+    ByteIterator_t iterator;
+    MQTTPacketInfo_t incomingPacket;
+    size_t packetLength;
+
+    iterator.p = pBuffer;
+    iterator.pEnd = &( pBuffer[ bufferLength ] );
+
+    if( pContext == NULL || pBuffer == NULL || bufferLength < 2 )
+    {
+        status = MQTTBadParameter;
+    }
+    else
+    {
+        /* Read packet type and flags (fixed, single-byte ) */
+        status = parseControlPacketType( &iterator, &( incomingPacket.type ) );
+    }
+
+    if( status != MQTTSuccess )
+    {
+        LogWarn( ( "Failed to parse Control Packet Type field: status=%u, value=%u.",
+                 ( unsigned int ) status, ( unsigned int ) ( incomingPacket.type ) ) );
+    }
+    else
+    {
+        /* Handle variable-size remaining length field */
+        status = parseLengthField( &iterator,
+                                   &( incomingPacket.remainingLength ) );
+
+        packetLength = incomingPacket.remainingLength + ( pBuffer - iterator.p );
+
+        if( pPacketLength != NULL )
+        {
+            *pPacketLength = packetLength;
+        }
+    }
+
+    if( status != MQTTSuccess )
+    {
+        LogWarn( ( "Failed to parse Remaining Length field: status=%u.",
+                 ( unsigned int ) status ) );
+    }
+    else if( packetLength > bufferLength )
+    {
+        status = MQTTPartialMessage;
+        LogError( ( "Partial message received. Expected length: %u", packetLength ) );
+    }
+    else
+    {
+        incomingPacket.pRemainingData = iterator.p;
+
+        assert( pContext->getTime );
+        pContext->lastPacketRxTime = pContext->getTime();
+
+        /* PUBLISH packets allow flags in the lower four bits. For other
+         * packet types, they are reserved. */
+        if( ( incomingPacket.type & 0xF0U ) == MQTT_PACKET_TYPE_PUBLISH )
+        {
+            status = handleIncomingPublish( pContext, &incomingPacket );
+        }
+        else
+        {
+            status = handleIncomingAck( pContext, &incomingPacket, true );
+        }
     }
 
     return status;
@@ -2383,7 +2589,7 @@ MQTTStatus_t MQTT_MatchTopic( const char * pTopicName,
 /*-----------------------------------------------------------*/
 
 MQTTStatus_t MQTT_GetSubAckStatusCodes( const MQTTPacketInfo_t * pSubackPacket,
-                                        uint8_t ** pPayloadStart,
+                                        const uint8_t ** pPayloadStart,
                                         size_t * pPayloadSize )
 {
     MQTTStatus_t status = MQTTSuccess;

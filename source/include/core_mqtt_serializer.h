@@ -95,17 +95,18 @@ struct MQTTPacketInfo;
  */
 typedef enum MQTTStatus
 {
-    MQTTSuccess = 0,     /**< Function completed successfully. */
-    MQTTBadParameter,    /**< At least one parameter was invalid. */
-    MQTTNoMemory,        /**< A provided buffer was too small. */
-    MQTTSendFailed,      /**< The transport send function failed. */
-    MQTTRecvFailed,      /**< The transport receive function failed. */
-    MQTTBadResponse,     /**< An invalid packet was received from the server. */
-    MQTTServerRefused,   /**< The server refused a CONNECT or SUBSCRIBE. */
-    MQTTNoDataAvailable, /**< No data available from the transport interface. */
-    MQTTIllegalState,    /**< An illegal state in the state record. */
-    MQTTStateCollision,  /**< A collision with an existing state record entry. */
-    MQTTKeepAliveTimeout /**< Timeout while waiting for PINGRESP. */
+    MQTTSuccess = 0,      /**< Function completed successfully. */
+    MQTTBadParameter,     /**< At least one parameter was invalid. */
+    MQTTNoMemory,         /**< A provided buffer was too small. */
+    MQTTSendFailed,       /**< The transport send function failed. */
+    MQTTRecvFailed,       /**< The transport receive function failed. */
+    MQTTBadResponse,      /**< An invalid packet was received from the server. */
+    MQTTServerRefused,    /**< The server refused a CONNECT or SUBSCRIBE. */
+    MQTTNoDataAvailable,  /**< No data available from the transport interface. */
+    MQTTIllegalState,     /**< An illegal state in the state record. */
+    MQTTStateCollision,   /**< A collision with an existing state record entry. */
+    MQTTKeepAliveTimeout, /**< Timeout while waiting for PINGRESP. */
+    MQTTPartialMessage    /**< Only a partial message was parsed */
 } MQTTStatus_t;
 
 /**
@@ -257,7 +258,7 @@ typedef struct MQTTPacketInfo
     /**
      * @brief Remaining serialized data in the MQTT packet.
      */
-    uint8_t * pRemainingData;
+    const uint8_t * pRemainingData;
 
     /**
      * @brief Length of remaining serialized data.

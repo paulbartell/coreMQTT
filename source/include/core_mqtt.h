@@ -883,7 +883,7 @@ MQTTStatus_t MQTT_MatchTopic( const char * pTopicName,
  */
 /* @[declare_mqtt_getsubackstatuscodes] */
 MQTTStatus_t MQTT_GetSubAckStatusCodes( const MQTTPacketInfo_t * pSubackPacket,
-                                        uint8_t ** pPayloadStart,
+                                        const uint8_t ** pPayloadStart,
                                         size_t * pPayloadSize );
 /* @[declare_mqtt_getsubackstatuscodes] */
 
