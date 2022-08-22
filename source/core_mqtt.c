@@ -51,7 +51,7 @@
  *
  * @return Total number of bytes sent, or negative value on network error.
  */
-static int32_t sendPacket( MQTTContext_t * pContext,
+static int32_t sendBuffer( MQTTContext_t * pContext,
                            const uint8_t * pBufferToSend,
                            size_t bytesToSend );
 
@@ -600,14 +600,82 @@ static bool matchTopicFilter( const char * pTopicName,
 
 /*-----------------------------------------------------------*/
 
-static int32_t sendPacket( MQTTContext_t * pContext,
+
+static int32_t sendMessageVector( MQTTContext_t * pContext,
+                                  TransportOutVector_t * pIoVec,
+                                  size_t ioVecCount )
+{
+    uint32_t timeoutTime;
+    uint32_t bytesToSend;
+    int32_t bytesSentOrError;
+    TransportOutVector_t * pIoVectIterator;
+
+    assert( pContext != NULL );
+    assert( pIoVec != NULL );
+    assert( pContext->getTime != NULL );
+    assert( pContext->transportInterface.send );    /* Send must alwaus be defined */
+
+    timeoutTime = pContext->getTime() + MQTT_SEND_RETRY_TIMEOUT_MS;
+
+    for( pIoVectIterator = pIoVec; pIoVectIterator < &( pIoVec[ ioVecCount ] ); pIoVectIterator++ )
+    {
+        bytesToSend += pIoVectIterator->iov_len;
+    }
+
+    pIoVectIterator = pIoVec;
+
+    while( ( pContext->getTime() < timeoutTime ) &&
+           ( bytesSentOrError < bytesToSend ) )
+    {
+        int32_t sendResult;
+        uint32_t bytesSentThisVector = 0U;
+
+        if( pContext->transportInterface.writev != NULL )
+        {
+            sendResult = pContext->transportInterface.writev( pContext->transportInterface.pNetworkContext,
+                                                              pIoVec,
+                                                              ioVecCount );
+        }
+        else
+        {
+            sendResult = sendBuffer( pContext,
+                                     pIoVectIterator->iov_base,
+                                     pIoVectIterator->iov_len,
+                                     ( timeoutTime - pContext->getTime() ) );
+        }
+
+        if( sendResult >= 0 )
+        {
+            bytesSentOrError += sendResult;
+            bytesSentThisVector += sendResult;
+        }
+        else
+        {
+            bytesSentOrError = sendResult;
+            break;
+        }
+
+        while( ( bytesSentThisVector > pIoVectIterator->iov_len ) &&
+               ( pIoVectIterator < &( pIoVec[ ioVecCount ] ) ) )
+        {
+            bytesSentThisVector -= pIoVectIterator->iov_len;
+            pIoVectIterator++;
+        }
+    }
+
+    return bytesSentOrError;
+}
+
+static int32_t sendBuffer( MQTTContext_t * pContext,
                            const uint8_t * pBufferToSend,
-                           size_t bytesToSend )
+                           size_t bytesToSend,
+                           uint32_t timeout )
 {
     const uint8_t * pIndex = pBufferToSend;
     size_t bytesRemaining = bytesToSend;
     int32_t totalBytesSent = 0, bytesSent;
     uint32_t lastSendTimeMs = 0U, timeSinceLastSendMs = 0U;
+    uint32_t timeoutTime;
     bool sendError = false;
 
     assert( pContext != NULL );
@@ -616,9 +684,7 @@ static int32_t sendPacket( MQTTContext_t * pContext,
     assert( pIndex != NULL );
 
     bytesRemaining = bytesToSend;
-
-    /* Record the most recent time of successful transmission. */
-    lastSendTimeMs = pContext->getTime();
+    timeoutTime = pContext->getTime() + timeout;
 
     /* Loop until the entire packet is sent. */
     while( ( bytesRemaining > 0UL ) && ( sendError == false ) )
@@ -970,9 +1036,10 @@ static MQTTStatus_t sendPublishAcks( MQTTContext_t * pContext,
 
         if( status == MQTTSuccess )
         {
-            bytesSent = sendPacket( pContext,
+            bytesSent = sendBuffer( pContext,
                                     pContext->networkBuffer.pBuffer,
-                                    MQTT_PUBLISH_ACK_PACKET_SIZE );
+                                    MQTT_PUBLISH_ACK_PACKET_SIZE,
+                                    MQTT_SEND_RETRY_TIMEOUT_MS );
         }
 
         if( bytesSent == ( int32_t ) MQTT_PUBLISH_ACK_PACKET_SIZE )
@@ -1425,109 +1492,46 @@ static MQTTStatus_t sendPublishWithoutCopy( MQTTContext_t * pContext,
                                             uint16_t packetId )
 {
     MQTTStatus_t status = MQTTSuccess;
-    int32_t bytesSent;
     uint8_t serializedPacketID[ 2 ];
-    const size_t packetIdLength = 2UL;
-    bool writeAndFlushAvailable;
+    TransportOutVector_t pIoVector[ 4 ];
+    size_t ioVectorLength;
+    size_t totalMessageLength;
 
-    writeAndFlushAvailable = ( ( pContext->transportInterface.write != NULL ) &&
-                             ( pContext->transportInterface.flush != NULL ) );
+    pIoVector[ 0U ].iov_base = pMqttHeader;
+    pIoVector[ 0U ].iov_len = headerSize;
+    totalMessageLength = headerSize;
 
-    /* Encode the packet ID. */
-    serializedPacketID[ 0 ] = ( ( uint8_t ) ( ( packetId ) >> 8 ) );
-    serializedPacketID[ 1 ] = ( ( uint8_t ) ( ( packetId ) & 0x00ffU ) );
+    pIoVector[ 1U ].iov_base = pPublishInfo->pTopicName;
+    pIoVector[ 1U ].iov_len = pPublishInfo->topicNameLength;
+    totalMessageLength += pPublishInfo->topicNameLength;
 
-    /* Send the serialized publish packet header over network. */
-    if( writeAndFlushAvailable == true )
+    ioVectorLength = 2U;
+
+    if( pPublishInfo->qos > MQTTQoS0 )
     {
-        bytesSent = pContext->transportInterface.write( pContext->transportInterface.pNetworkContext,
-                                                        pMqttHeader,
-                                                        headerSize );
-    }
-    else
-    {
-        bytesSent = sendPacket( pContext,
-                                pMqttHeader,
-                                headerSize );
+        /* Encode the packet ID. */
+        serializedPacketID[ 0 ] = ( ( uint8_t ) ( ( packetId ) >> 8 ) );
+        serializedPacketID[ 1 ] = ( ( uint8_t ) ( ( packetId ) & 0x00ffU ) );
+
+        pIoVector[ ioVectorLength ].iov_base = serializedPacketID;
+        pIoVector[ ioVectorLength ].iov_len = 2U;
+
+        ioVectorLength++;
+        totalMessageLength += 2U;
     }
 
-    if( bytesSent != ( int32_t ) headerSize )
+    if( pPublishInfo->payloadLength > 0U )
+    {
+        pIoVector[ ioVectorLength ].iov_base = pPublishInfo->pPayload;;
+        pIoVector[ ioVectorLength ].iov_len = pPublishInfo->payloadLength;
+
+        ioVectorLength++;
+        totalMessageLength += pPublishInfo->payloadLength;
+    }
+
+    if( sendMessageVector( pContext, pIoVector, ioVectorLength ) != ( int32_t ) totalMessageLength )
     {
         status = MQTTSendFailed;
-    }
-    else
-    {
-        /* Send the topic string over the network. */
-        if( writeAndFlushAvailable == true )
-        {
-            bytesSent = pContext->transportInterface.write( pContext->transportInterface.pNetworkContext,
-                                                            ( const uint8_t* )pPublishInfo->pTopicName,
-                                                            pPublishInfo->topicNameLength );
-        }
-        else
-        {
-            bytesSent = sendPacket( pContext,
-                                    ( const uint8_t * ) pPublishInfo->pTopicName,
-                                    pPublishInfo->topicNameLength );
-        }
-
-        if( bytesSent != ( ( int32_t ) pPublishInfo->topicNameLength ) )
-        {
-            status = MQTTSendFailed;
-        }
-    }
-
-    if( ( status == MQTTSuccess ) && ( pPublishInfo->qos > MQTTQoS0 ) )
-    {
-        /* Send the packet ID over the network. */
-        if( writeAndFlushAvailable == true )
-        {
-            bytesSent = pContext->transportInterface.write( pContext->transportInterface.pNetworkContext,
-                                                            serializedPacketID,
-                                                            packetIdLength );
-        }
-        else
-        {
-            bytesSent = sendPacket( pContext,
-                                    serializedPacketID,
-                                    packetIdLength );
-        }
-
-        if( bytesSent != ( int32_t ) packetIdLength )
-        {
-            status = MQTTSendFailed;
-        }
-    }
-
-    if( ( status == MQTTSuccess ) &&
-        ( pPublishInfo->payloadLength > 0U ) )
-    {
-        /* Send Payload if there is one to send. It is valid for a PUBLISH
-         * Packet to contain a zero length payload.*/
-        if( writeAndFlushAvailable == true )
-        {
-            bytesSent = pContext->transportInterface.write( pContext->transportInterface.pNetworkContext,
-                                                            pPublishInfo->pPayload,
-                                                            pPublishInfo->payloadLength );
-        }
-        else
-        {
-            bytesSent = sendPacket( pContext,
-                                    pPublishInfo->pPayload,
-                                    pPublishInfo->payloadLength );
-        }
-
-        if( bytesSent != ( ( int32_t ) pPublishInfo->payloadLength ) )
-        {
-            status = MQTTSendFailed;
-        }
-    }
-
-    if( ( status == MQTTSuccess ) &&
-        ( writeAndFlushAvailable == true ) )
-    {
-        /* Flush the buffers to send the message over the network. */
-        ( void ) pContext->transportInterface.flush( pContext->transportInterface.pNetworkContext );
     }
 
     return status;
@@ -1878,9 +1882,10 @@ MQTTStatus_t MQTT_Connect( MQTTContext_t * pContext,
 
     if( status == MQTTSuccess )
     {
-        bytesSent = sendPacket( pContext,
+        bytesSent = sendBuffer( pContext,
                                 pContext->networkBuffer.pBuffer,
-                                packetSize );
+                                packetSize,
+                                MQTT_SEND_RETRY_TIMEOUT_MS );
 
         if( bytesSent < ( int32_t ) packetSize )
         {
@@ -1969,9 +1974,10 @@ MQTTStatus_t MQTT_Subscribe( MQTTContext_t * pContext,
     if( status == MQTTSuccess )
     {
         /* Send serialized MQTT SUBSCRIBE packet to transport layer. */
-        bytesSent = sendPacket( pContext,
+        bytesSent = sendBuffer( pContext,
                                 pContext->networkBuffer.pBuffer,
-                                packetSize );
+                                packetSize,
+                                MQTT_SEND_RETRY_TIMEOUT_MS );
 
         if( bytesSent < ( int32_t ) packetSize )
         {
@@ -2118,9 +2124,10 @@ MQTTStatus_t MQTT_Ping( MQTTContext_t * pContext )
     if( status == MQTTSuccess )
     {
         /* Send the serialized PINGREQ packet to transport layer. */
-        bytesSent = sendPacket( pContext,
+        bytesSent = sendBuffer( pContext,
                                 localBuffer.pBuffer,
-                                packetSize );
+                                MQTT_PACKET_PINGREQ_SIZE,
+                                MQTT_SEND_RETRY_TIMEOUT_MS );
 
         /* It is an error to not send the entire PINGREQ packet. */
         if( bytesSent < ( int32_t ) packetSize )
@@ -2181,9 +2188,10 @@ MQTTStatus_t MQTT_Unsubscribe( MQTTContext_t * pContext,
     if( status == MQTTSuccess )
     {
         /* Send serialized MQTT UNSUBSCRIBE packet to transport layer. */
-        bytesSent = sendPacket( pContext,
+        bytesSent = sendBuffer( pContext,
                                 pContext->networkBuffer.pBuffer,
-                                packetSize );
+                                packetSize,
+                                MQTT_SEND_RETRY_TIMEOUT_MS );
 
         if( bytesSent < ( int32_t ) packetSize )
         {
@@ -2236,9 +2244,10 @@ MQTTStatus_t MQTT_Disconnect( MQTTContext_t * pContext )
 
     if( status == MQTTSuccess )
     {
-        bytesSent = sendPacket( pContext,
+        bytesSent = sendBuffer( pContext,
                                 localBuffer.pBuffer,
-                                packetSize );
+                                packetSize,
+                                MQTT_SEND_RETRY_TIMEOUT_MS );
 
         if( bytesSent < ( int32_t ) packetSize )
         {
